@@ -1,13 +1,12 @@
 {
   "version": 2,
   "builds": [
-    {
-      "src": "spin.py",
-      "use": "@vercel/python"
-    }
+    { "src": "spin.py", "use": "@vercel/python" }
   ],
   "routes": [
-    { "src": "/api/spin", "dest": "spin.py" },
-    { "src": "/spin",     "dest": "spin.py" }
+    { "src": "/api/spin",   "dest": "spin.py" },
+    { "src": "/spin",       "dest": "spin.py" },
+    { "src": "/health",     "dest": "spin.py" },
+    { "src": "/api/health", "dest": "spin.py" }
   ]
 }
