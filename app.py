@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
 Vercel serverless handler (flat layout).
-Usage:  GET  /api/spin?uid=<UID>&pass=<PASSWORD>[&payload=<hex>]
-        POST /api/spin  { "uid": "...", "pass": "..." }
+
+Usage:
+    GET  /api/spin?uid=<UID>&pass=<PASSWORD>[&payload=<hex>]
+    POST /api/spin  { "uid": "...", "pass": "..." }
 Returns only the gained item(s) as JSON.
+
+Visiting the base URL (no query string) returns the plain text "Running".
 """
 
 import os
@@ -18,18 +22,23 @@ import asyncio
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-# Ensure output_pb2.py (same directory as this file) is importable
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# --- Make output_pb2.py (same directory as this file) importable -------- #
+try:
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+    if _HERE and _HERE not in sys.path:
+        sys.path.insert(0, _HERE)
+except NameError:
+    # __file__ is not always defined inside serverless runtimes
+    pass
 
 import aiohttp
 
+_PB2_IMPORT_ERROR = None
 try:
     import output_pb2
 except Exception as e:
     output_pb2 = None
     _PB2_IMPORT_ERROR = str(e)
-else:
-    _PB2_IMPORT_ERROR = None
 
 
 # ------------------------------------------------------------------ #
@@ -102,6 +111,8 @@ def _extract_ids_from_bytes(data: bytes):
             if not (b & 0x80):
                 break
             shift += 7
+            if shift > 63:            # guard against runaway shifts
+                break
         if 100000000 <= value <= 999999999:
             if not any(x["id"] == value for x in items):
                 items.append({"id": value, "name": RARE_ITEMS_DB.get(value)})
@@ -111,12 +122,14 @@ def _extract_ids_from_bytes(data: bytes):
 def parse_gacha_response(data: bytes):
     items = []
 
+    # 1) gzip transparent
     try:
         if data.startswith(b"\x1f\x8b"):
             data = zlib.decompress(data, 16 + zlib.MAX_WBITS)
     except Exception:
         pass
 
+    # 2) protobuf
     if output_pb2 is not None:
         try:
             resp = output_pb2.Garena_420()
@@ -128,6 +141,7 @@ def parse_gacha_response(data: bytes):
         except Exception:
             pass
 
+    # 3) plain text fallback
     if not items:
         try:
             for num in re.findall(r"\d{9}", data.decode("utf-8", errors="ignore")):
@@ -137,6 +151,7 @@ def parse_gacha_response(data: bytes):
         except Exception:
             pass
 
+    # 4) raw byte scan
     if not items:
         items = _extract_ids_from_bytes(data)
 
@@ -209,7 +224,8 @@ async def gacha_req(session, token, payload, url, max_retries=3):
 # ------------------------------------------------------------------ #
 async def spin(uid: str, password: str, payload_hex: str = None):
     if output_pb2 is None:
-        return {"success": False, "error": f"protobuf_load_failed: {_PB2_IMPORT_ERROR}"}
+        return {"success": False,
+                "error": f"protobuf_load_failed: {_PB2_IMPORT_ERROR}"}
 
     payload_hex = (payload_hex or NARUTO_PAYLOAD).replace(" ", "")
     try:
@@ -246,23 +262,55 @@ async def spin(uid: str, password: str, payload_hex: str = None):
 # ------------------------------------------------------------------ #
 #  VERCEL HANDLER
 # ------------------------------------------------------------------ #
+def _first(params: dict, *keys):
+    """Safely fetch the first value for any of the given keys."""
+    for k in keys:
+        v = params.get(k)
+        if isinstance(v, list) and v:
+            return v[0]
+        if isinstance(v, str):
+            return v
+    return None
+
+
 class handler(BaseHTTPRequestHandler):
+
+    # ---------- helpers ---------- #
+    def _cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def _send_text(self, code: int, text: str):
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_json(self, code: int, obj: dict):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._cors_headers()
         self.end_headers()
         self.wfile.write(body)
 
+    # ---------- core ---------- #
     def _run(self, params: dict):
-        uid = params.get("uid", [None])[0]
-        pwd = params.get("pass", [None])[0] or params.get("password", [None])[0]
-        payload_hex = params.get("payload", [None])[0]
+        uid = _first(params, "uid")
+        pwd = _first(params, "pass", "password")
+        payload_hex = _first(params, "payload")
 
         if not uid or not pwd:
-            self._send_json(400, {"success": False, "error": "missing_params: uid & pass required"})
+            self._send_json(
+                400,
+                {"success": False,
+                 "error": "missing_params: uid & pass required"},
+            )
             return
 
         try:
@@ -272,16 +320,36 @@ class handler(BaseHTTPRequestHandler):
 
         self._send_json(200 if result.get("success") else 502, result)
 
+    # ---------- HTTP verbs ---------- #
     def do_GET(self):
         parsed = urlparse(self.path)
-        self._run(parse_qs(parsed.query))
+        query = parse_qs(parsed.query, keep_blank_values=True)
+
+        # No query string  ->  home page
+        if not query:
+            self._send_text(200, "Running")
+            return
+
+        self._run(query)
 
     def do_POST(self):
         try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode("utf-8") if length else "{}"
-            data = json.loads(body)
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("JSON body must be an object")
             params = {k: [str(v)] for k, v in data.items()}
-        except Exception:
-            params = {}
+        except Exception as e:
+            self._send_json(
+                400,
+                {"success": False, "error": f"invalid_json_body: {e}"},
+            )
+            return
         self._run(params)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors_headers()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
