@@ -34,11 +34,13 @@ else:
 # ------------------------------------------------------------------ #
 #  CONSTANTS
 # ------------------------------------------------------------------ #
-# --- JWT PROVIDER ---
 EXTERNAL_API_URL = "https://ff-jwt-gen-api.lovable.app/api/public/token"
 
 RELEASE_VERSION = "OB55"
-DEFAULT_URL     = "https://client.ind.freefiremobile.com"
+CLIENT_VERSION  = "1.132.6"
+
+# Default host (India) — used only if region lookup fails
+DEFAULT_URL = "https://client.ind.freefiremobile.com"
 
 NARUTO_PAYLOAD    = "D120B9DAAC2C87872B8C115DFD74A832"
 FALLBACK_PAYLOADS = [
@@ -65,29 +67,37 @@ TG_STATE = {
     "total_failed":    0,
 }
 
-# ─── Region → gacha host ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
+#  Region → gacha host  (3-cluster layout, v2.9)
+# ──────────────────────────────────────────────────────────────────
+#   IND      → client.ind.freefiremobile.com
+#   AMERICA  → client.us.freefiremobile.com
+#   OTHERS   → clientbp.ppmainecoonghj.com
+# ──────────────────────────────────────────────────────────────────
 REGION_URL_MAP = {
-    # ─── India ───────────────────────────────────────
+    # ─── IND cluster ─────────────────────────────────
     "IND": "https://client.ind.freefiremobile.com",
     "IN":  "https://client.ind.freefiremobile.com",
 
-    # ─── Polar Bear cluster (ggpolarbear.com) ────────
-    "TH":  "https://clientbp.ggpolarbear.com",
-    "ME":  "https://clientbp.ggpolarbear.com",
-    "EU":  "https://clientbp.ggpolarbear.com",
-    "VN":  "https://clientbp.ggpolarbear.com",
-    "BD":  "https://clientbp.ggpolarbear.com",
-    "TW":  "https://clientbp.ggpolarbear.com",
-    "RU":  "https://clientbp.ggpolarbear.com",
-    "SG":  "https://clientbp.ggpolarbear.com",
-    "ID":  "https://clientbp.ggpolarbear.com",   # kept from previous
-    "PK":  "https://clientbp.ggpolarbear.com",   # kept from previous
-
-    # ─── US cluster (client.us.freefiremobile.com) ───
+    # ─── AMERICA cluster ─────────────────────────────
     "NA":  "https://client.us.freefiremobile.com",
     "SAC": "https://client.us.freefiremobile.com",
     "BR":  "https://client.us.freefiremobile.com",
     "US":  "https://client.us.freefiremobile.com",
+    "AMERICA": "https://client.us.freefiremobile.com",
+
+    # ─── OTHERS cluster (clientbp.ppmainecoonghj.com) ─
+    "TH":  "https://clientbp.ppmainecoonghj.com",
+    "ME":  "https://clientbp.ppmainecoonghj.com",
+    "EU":  "https://clientbp.ppmainecoonghj.com",
+    "VN":  "https://clientbp.ppmainecoonghj.com",
+    "BD":  "https://clientbp.ppmainecoonghj.com",
+    "TW":  "https://clientbp.ppmainecoonghj.com",
+    "RU":  "https://clientbp.ppmainecoonghj.com",
+    "SG":  "https://clientbp.ppmainecoonghj.com",
+    "ID":  "https://clientbp.ppmainecoonghj.com",
+    "PK":  "https://clientbp.ppmainecoonghj.com",
+    "OTHERS": "https://clientbp.ppmainecoonghj.com",
 }
 
 RARE_ITEMS_DB = {
@@ -469,7 +479,7 @@ async def spin(uid: str, password: str, payload_hex: str = None):
 #  HEALTH CHECK
 # ------------------------------------------------------------------ #
 HEALTH_START_TS = time.time()
-HEALTH_VERSION  = "2.8"
+HEALTH_VERSION  = "2.9"
 
 
 async def _probe_upstream(session, url, timeout=6):
