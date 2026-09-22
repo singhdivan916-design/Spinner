@@ -5,6 +5,7 @@ Vercel serverless handler.
 Events:
   ?event=naruto  (default) — PurchaseGacha + Naruto Bundle prank
   ?event=faded            — EliminateGoodsFromLimitPool → PurchaseGacha
+  ?event=normal           — PurchaseGacha (real items, no prank)
 
 JWT strategy:
   1. Try primary first.
@@ -67,15 +68,25 @@ JWT_PROVIDERS = [
 # ------------------------------------------------------------------ #
 #  EVENT CONFIG
 # ------------------------------------------------------------------ #
-NARUTO_PAYLOAD  = "D120B9DAAC2C87872B8C115DFD74A832"
+# --- Naruto event ---
+NARUTO_PAYLOAD   = "D120B9DAAC2C87872B8C115DFD74A832"
 NARUTO_FALLBACKS = [
     "7DF7F8996CD696356CD01BCBD2B3CDE8",
     "7FCB76B6CB40C0FFD3FBBDDA4600C039",
 ]
 
+# --- Faded wheel event ---
 FADED_PAYLOAD   = "B31B32FB8303719D61FC461DC26135E4"
 FADED_FALLBACKS = ["3D91D5DF338384E0D1E27505230D1365"]
 FADED_ELIMINATE_PAYLOAD = "6F02DE6FB351FFB2521C944DA0E6C1EB"
+
+# --- Normal event (Nine Tails / M4A1 / Obito) ---
+NORMAL_PAYLOAD   = "A2230108442CE3F8EEC41AC9B6B8606D"
+NORMAL_FALLBACKS = [
+    "18138AD791CDB12C351BC4BEA176EA90",
+    "7D343C717F0ECB6A03B1F1A2CE6058DA",
+    "2D41F20BFF93302B3326372942870984",
+]
 
 EVENTS = {
     "naruto": {
@@ -89,6 +100,12 @@ EVENTS = {
         "payloads": [FADED_PAYLOAD] + FADED_FALLBACKS,
         "eliminate": True,
         "eliminate_payload": FADED_ELIMINATE_PAYLOAD,
+        "prank": False,
+    },
+    "normal": {
+        "name": "Normal Event (Nine Tails)",
+        "payloads": [NORMAL_PAYLOAD] + NORMAL_FALLBACKS,
+        "eliminate": False,
         "prank": False,
     },
 }
@@ -147,13 +164,19 @@ TG_STATE = {
 }
 
 RARE_ITEMS_DB = {
+    # Naruto event
     710047022: "Naruto Bundle",
     801055004: "Naruto Token",
     903047008: "Loot Box - Body Substitution",
     904047008: "Backpack - Ninja's Scroll",
-    907104745: "Fist - Ninjutsu Theme",
     907104746: "Gloo Wall - Hokage Rock",
     909047015: "Rasengan - Emote",
+    # Faded wheel
+    907104745: "Fist - Ninjutsu Theme",
+    # Normal event
+    911004701: "The Nine Tails Theme",
+    907104744: "M4A1 - Naruto Theme",
+    211047048: "Obito Headwear",
 }
 
 
@@ -396,11 +419,6 @@ async def _try_one_provider(session, provider, uid, password, retries=2):
 
 
 async def get_token_data(session, uid, password):
-    """
-    Strategy:
-      1. Try primary first.
-      2. On failure, race all fallbacks in parallel — first valid token wins.
-    """
     primary   = JWT_PROVIDERS[0]
     fallbacks = JWT_PROVIDERS[1:]
 
@@ -636,7 +654,7 @@ async def spin(uid: str, password: str, payload_hex: str = None,
 #  HEALTH
 # ------------------------------------------------------------------ #
 HEALTH_START_TS = time.time()
-HEALTH_VERSION  = "3.0"
+HEALTH_VERSION  = "3.1"
 
 
 async def _probe_upstream(session, url, timeout=6):
